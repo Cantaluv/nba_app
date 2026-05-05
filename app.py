@@ -348,16 +348,45 @@ abbr_map = {f"{TEAM_NAMES.get(t, t)} ({t})": t for t in all_teams}
 # ── Fetch upcoming schedule ───────────────────────────────────────────────────
 @st.cache_data(ttl=3600)
 def fetch_upcoming_schedule(days_ahead=7):
-    """Fetch upcoming NBA games from nba_api or fallback to scoreboard endpoint."""
+    """Fetch upcoming NBA games - tries multiple APIs."""
     games = []
     today = datetime.now()
 
+    # ── Source 1: balldontlie.io (most reliable on Streamlit Cloud) ──
     try:
-        # Try nba_api if installed
-        from nba_api.live.nba.endpoints import scoreboard as live_sb
-        from nba_api.stats.endpoints import leaguegamefinder
+        start_date = today.strftime("%Y-%m-%d")
+        end_date = (today + timedelta(days=days_ahead)).strftime("%Y-%m-%d")
+        url = "https://api.balldontlie.io/v1/games"
+        headers = {"Authorization": "0"}  # free tier, no key needed for basic use
+        params = {
+            "start_date": start_date,
+            "end_date": end_date,
+            "per_page": 100,
+        }
+        resp = requests.get(url, params=params, headers=headers, timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            for g in data.get("data", []):
+                home_abbr = g.get("home_team", {}).get("abbreviation", "")
+                away_abbr = g.get("visitor_team", {}).get("abbreviation", "")
+                date_str = g.get("date", "")[:10]  # "2025-05-07"
+                status = g.get("status", "TBD")
+                if home_abbr and away_abbr and date_str:
+                    dt = datetime.strptime(date_str, "%Y-%m-%d")
+                    games.append({
+                        "date": dt.strftime("%d/%m/%Y"),
+                        "date_dt": dt,
+                        "home": home_abbr,
+                        "away": away_abbr,
+                        "time": status if status not in ["Final", ""] else "Final",
+                    })
+            if games:
+                return games
+    except Exception:
+        pass
 
-        # Try fetching next 7 days via scoreboardv2
+    # ── Source 2: nba_api (if installed) ──
+    try:
         from nba_api.stats.endpoints import scoreboardv2
         for delta in range(0, days_ahead):
             game_date = (today + timedelta(days=delta)).strftime("%m/%d/%Y")
@@ -367,42 +396,37 @@ def fetch_upcoming_schedule(days_ahead=7):
                 for _, row in header.iterrows():
                     home_id = int(row.get("HOME_TEAM_ID", 0))
                     away_id = int(row.get("VISITOR_TEAM_ID", 0))
-                    home_abbr = NBA_ID_TO_ABBR.get(home_id, "")
-                    away_abbr = NBA_ID_TO_ABBR.get(away_id, "")
-                    if home_abbr and away_abbr:
-                        game_time = row.get("GAME_STATUS_TEXT", "TBD")
+                    h = NBA_ID_TO_ABBR.get(home_id, "")
+                    a = NBA_ID_TO_ABBR.get(away_id, "")
+                    if h and a:
                         games.append({
-                            "date": game_date,
+                            "date": (today + timedelta(days=delta)).strftime("%d/%m/%Y"),
                             "date_dt": today + timedelta(days=delta),
-                            "home": home_abbr,
-                            "away": away_abbr,
-                            "time": game_time,
+                            "home": h,
+                            "away": a,
+                            "time": row.get("GAME_STATUS_TEXT", "TBD"),
                         })
             except Exception:
                 pass
-        return games
-
+        if games:
+            return games
     except ImportError:
         pass
 
-    # Fallback: use ESPN's public schedule API (no auth needed)
+    # ── Source 3: ESPN API ──
     try:
         url = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard"
-        headers = {"User-Agent": "Mozilla/5.0"}
-
-        # Fetch multiple dates
         for delta in range(0, days_ahead):
             date_str = (today + timedelta(days=delta)).strftime("%Y%m%d")
-            resp = requests.get(url, params={"dates": date_str}, headers=headers, timeout=8)
+            resp = requests.get(url, params={"dates": date_str},
+                                headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
             if resp.status_code != 200:
                 continue
-            data = resp.json()
-            for event in data.get("events", []):
+            for event in resp.json().get("events", []):
                 comps = event.get("competitions", [{}])[0]
-                competitors = comps.get("competitors", [])
                 home_abbr, away_abbr = "", ""
                 game_time = comps.get("status", {}).get("type", {}).get("shortDetail", "TBD")
-                for c in competitors:
+                for c in comps.get("competitors", []):
                     abbr = c.get("team", {}).get("abbreviation", "")
                     if c.get("homeAway") == "home":
                         home_abbr = abbr
